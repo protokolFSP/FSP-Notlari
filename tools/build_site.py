@@ -2,24 +2,10 @@
 """
 Google Drive (public folder) -> GitHub Pages static site builder (no Jekyll).
 
-Usage:
-  python tools/build_site.py --sync-drive
-  python tools/build_site.py --build
-
-Input (synced):
-  content/drive/**.(docx|pdf)
-
-Output (generated):
-  docs/index.html
-  docs/notes/index.html
-  docs/downloads/index.html
-  docs/notes/**.html
-  docs/downloads/**.(docx|pdf)
-  docs/assets/**
-
-Behavior:
-  - Sync step FAILS if no DOCX/PDF found (prevents committing an empty site).
-  - Uses gdown API first; falls back to gdown CLI if needed.
+Why this exists:
+- gdown exports Google Docs as DOCX via docs.google.com/export?format=docx
+- but sometimes saves files WITHOUT ".docx" extension.
+- We normalize downloaded files by sniffing file signatures and renaming to .docx/.pdf.
 """
 
 from __future__ import annotations
@@ -67,6 +53,7 @@ def main() -> None:
         if not GDRIVE_URL:
             raise SystemExit("GDRIVE_FOLDER_URL env is empty.")
         sync_drive_folder(GDRIVE_URL, SRC_DIR)
+        normalize_downloaded_files(SRC_DIR)
         assert_has_docs(SRC_DIR)
 
     if args.build:
@@ -135,6 +122,57 @@ def sync_drive_folder(url: str, out_dir: Path) -> None:
     subprocess.check_call(cmd)
 
 
+def sniff_kind(path: Path) -> Optional[str]:
+    try:
+        with path.open("rb") as f:
+            head = f.read(8)
+    except OSError:
+        return None
+
+    if head.startswith(b"%PDF"):
+        return "pdf"
+
+    # DOCX is a ZIP container; this signature is also used by pptx/xlsx,
+    # but our Drive export uses format=docx so treating as docx is OK.
+    if head.startswith(b"PK\x03\x04"):
+        return "docx"
+
+    return None
+
+
+def unique_path(target: Path) -> Path:
+    if not target.exists():
+        return target
+    base = target.with_suffix("")
+    suf = target.suffix
+    for i in range(1, 1000):
+        candidate = Path(f"{base}-{i}{suf}")
+        if not candidate.exists():
+            return candidate
+    raise SystemExit(f"Could not find unique filename for {target}")
+
+
+def normalize_downloaded_files(root: Path) -> None:
+    """
+    Rename extensionless exported files to .docx/.pdf based on file signature.
+    Fixes gdown behavior where exported Google Docs are saved without extension.
+    """
+    for p in sorted([x for x in root.rglob("*") if x.is_file()], key=lambda x: str(x).lower()):
+        if p.suffix.lower() in {".docx", ".pdf"}:
+            continue
+        # skip google stub files if present
+        if p.suffix.lower() in {".gdoc", ".gsheet", ".gslides"}:
+            continue
+
+        kind = sniff_kind(p)
+        if not kind:
+            continue
+
+        target = unique_path(p.with_suffix(f".{kind}"))
+        p.rename(target)
+        print(f"[normalize] {p} -> {target}")
+
+
 def assert_has_docs(root: Path) -> None:
     docx = list(root.rglob("*.docx"))
     pdf = list(root.rglob("*.pdf"))
@@ -142,18 +180,9 @@ def assert_has_docs(root: Path) -> None:
         print(f"[sync] found DOCX={len(docx)} PDF={len(pdf)}")
         return
 
-    # Helpful hint for Google Docs formats
-    gdocs = list(root.rglob("*.gdoc")) + list(root.rglob("*.gsheet")) + list(root.rglob("*.gslides"))
-    hint = ""
-    if gdocs:
-        hint = (
-            "\nIt looks like the folder contains Google Docs/Sheets/Slides.\n"
-            "Download/export them as .docx/.pdf and upload those files into the folder."
-        )
-
     raise SystemExit(
         "No .docx/.pdf found after sync. "
-        "Ensure Drive folder is 'Anyone with the link' (public) and files are real .docx/.pdf." + hint
+        "Ensure Drive folder is 'Anyone with the link' (public) and files are real .docx/.pdf."
     )
 
 
@@ -303,11 +332,7 @@ def build_docx(e: Entry) -> None:
       {result.value}
     """
     e.out_html.write_text(
-        wrap_html(
-            title=e.title,
-            body_html=body,
-            home_href=rel_from(e.out_html, DOCS_DIR / "index.html").as_posix(),
-        ),
+        wrap_html(title=e.title, body_html=body, home_href=rel_from(e.out_html, DOCS_DIR / "index.html").as_posix()),
         encoding="utf-8",
     )
 
@@ -324,11 +349,7 @@ def build_pdf(e: Entry) -> None:
       <iframe src="{pdf_href}" width="100%" height="900" style="border:1px solid #ddd; border-radius:12px;"></iframe>
     """
     e.out_html.write_text(
-        wrap_html(
-            title=e.title,
-            body_html=body,
-            home_href=rel_from(e.out_html, DOCS_DIR / "index.html").as_posix(),
-        ),
+        wrap_html(title=e.title, body_html=body, home_href=rel_from(e.out_html, DOCS_DIR / "index.html").as_posix()),
         encoding="utf-8",
     )
 
@@ -361,7 +382,9 @@ def build_indexes(entries: Iterable[Entry]) -> None:
                 read_href = rel_from(DOCS_DIR / "index.html", e.out_html).as_posix()
                 dl_href = rel_from(DOCS_DIR / "index.html", e.out_file).as_posix()
                 icon = "📖" if e.kind == "docx" else "📄"
-                body_lines.append(f'<li>{icon} <a href="{read_href}">{e.title}</a> · <a href="{dl_href}">⬇️ {e.kind.upper()}</a></li>')
+                body_lines.append(
+                    f'<li>{icon} <a href="{read_href}">{e.title}</a> · <a href="{dl_href}">⬇️ {e.kind.upper()}</a></li>'
+                )
             body_lines.append("</ul>")
 
     body_lines += [

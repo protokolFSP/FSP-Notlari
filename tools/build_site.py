@@ -2,19 +2,14 @@
 """
 Google Drive (public folder) -> GitHub Pages static site builder (no Jekyll).
 
-Features:
-- Downloads a public Drive folder.
-- Normalizes downloaded files by sniffing signatures:
-  - %PDF -> .pdf
-  - PK.. (zip) -> .docx (Drive export format=docx)
-  - <html / <!doctype -> treated as permission/error page and fails with a clear message
-- Generates:
-  - docs/index.html
-  - docs/notes/**/*.html
-  - docs/downloads/** (original files)
-  - docs/assets/** (extracted images from docx)
-  - docs/manifest.json
-  - docs/_ci/build_site.log + docs/_ci/failure.json (on failures)
+- DOCX rendering modes:
+  - pdf  : convert docx->pdf (LibreOffice) + embed PDF (best fidelity)
+  - html : mammoth html (best for clean HTML, not 1:1 layout)
+  - both : embed PDF + also include mammoth HTML below
+
+Also writes:
+- docs/manifest.json
+- docs/_ci/build_site.log + docs/_ci/failure.json (on failures)
 """
 
 from __future__ import annotations
@@ -28,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -58,7 +54,7 @@ class Entry:
     rel_stem: str
     src: Path
     out_html: Path
-    out_file: Path
+    out_file: Path  # for docx: .docx, for pdf: .pdf
     sort_key: Tuple[int, str]
 
 
@@ -93,7 +89,7 @@ def main() -> None:
                 current_entry = e
                 LOG.info("[build] %s -> %s", e.src, e.out_html)
                 if e.kind == "docx":
-                    build_docx(e, lang=args.lang)
+                    build_docx(e, lang=args.lang, docx_render=args.docx_render)
                 else:
                     build_pdf(e, lang=args.lang)
 
@@ -129,6 +125,12 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--lang", default="tr", help="HTML <html lang='...'>")
     p.add_argument("--site-title", default="FSP Notları", help="Root index title")
+    p.add_argument(
+        "--docx-render",
+        choices=["pdf", "html", "both"],
+        default="pdf",
+        help="How to render DOCX for reading pages",
+    )
 
     p.add_argument("--log-file", default=str(OUT_CI / "build_site.log"), help="Log file path (for CI artifacts)")
     p.add_argument("--log-level", default="INFO", help="DEBUG|INFO|WARNING|ERROR")
@@ -445,11 +447,6 @@ def content_type_to_ext(ct: str) -> str:
 
 
 def read_mammoth_image_bytes(image: object) -> bytes:
-    """
-    mammoth Image API varies by version:
-      - some versions: image.read() -> bytes
-      - others: image.open() -> file-like (context manager)
-    """
     read_fn = getattr(image, "read", None)
     if callable(read_fn):
         data = read_fn()
@@ -495,6 +492,8 @@ def wrap_html(*, title: str, body_html: str, home_href: str, lang: str) -> str:
       pre,code{background:#f6f8fa;border-radius:8px}
       pre{padding:12px;overflow:auto}
       hr{border:none;border-top:1px solid #eee;margin:18px 0}
+      details{border:1px solid #eee;border-radius:16px;padding:12px}
+      summary{cursor:pointer}
     """
     head.append(style)
 
@@ -522,48 +521,118 @@ def wrap_html(*, title: str, body_html: str, home_href: str, lang: str) -> str:
     return "<!doctype html>\n" + str(soup)
 
 
-def build_docx(e: Entry, *, lang: str) -> None:
+def soffice_path() -> str:
+    p = shutil.which("soffice") or shutil.which("libreoffice")
+    if not p:
+        raise SystemExit(
+            "LibreOffice (soffice) not found. Install it to enable DOCX->PDF rendering.\n"
+            "CI: sudo apt-get update && sudo apt-get install -y libreoffice\n"
+            "Local: install LibreOffice and ensure `soffice` is in PATH."
+        )
+    return p
+
+
+def convert_docx_to_pdf(src_docx: Path, out_pdf: Path) -> None:
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    exe = soffice_path()
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp_out = Path(td)
+        cmd = [
+            exe,
+            "--headless",
+            "--nologo",
+            "--nofirststartwizard",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            str(tmp_out),
+            str(src_docx),
+        ]
+        LOG.info("[docx->pdf] %s", " ".join(cmd))
+        subprocess.check_call(cmd)
+
+        produced = tmp_out / f"{src_docx.stem}.pdf"
+        if not produced.exists():
+            candidates = list(tmp_out.glob("*.pdf"))
+            raise SystemExit(f"DOCX->PDF failed: no PDF produced for {src_docx}. Candidates: {candidates}")
+
+        shutil.move(str(produced), str(out_pdf))
+
+
+def docx_pdf_target(e: Entry) -> Path:
+    return e.out_file.with_suffix(".pdf")
+
+
+def build_docx(e: Entry, *, lang: str, docx_render: str) -> None:
     shutil.copy2(e.src, e.out_file)
 
-    img_dir = OUT_ASSETS / e.rel_dir / e.rel_stem
-    img_dir.mkdir(parents=True, exist_ok=True)
-    img_counter = {"i": 0}
+    pdf_path = docx_pdf_target(e)
+    if docx_render in {"pdf", "both"}:
+        convert_docx_to_pdf(e.src, pdf_path)
 
-    def convert_image(image: mammoth.images.Image) -> dict:
-        img_counter["i"] += 1
-        ext = content_type_to_ext(image.content_type)
-        filename = f"img-{img_counter['i']:03d}.{ext}"
-        out_path = img_dir / filename
-        out_path.write_bytes(read_mammoth_image_bytes(image))
-        return {"src": rel_from(e.out_html, out_path)}
+    dl_docx = rel_from(e.out_html, e.out_file)
+    dl_pdf = rel_from(e.out_html, pdf_path) if pdf_path.exists() else ""
 
-    with e.src.open("rb") as f:
-        result = mammoth.convert_to_html(f, convert_image=mammoth.images.img_element(convert_image))
+    html_section = ""
+    if docx_render in {"html", "both"}:
+        img_dir = OUT_ASSETS / e.rel_dir / e.rel_stem
+        img_dir.mkdir(parents=True, exist_ok=True)
+        img_counter = {"i": 0}
 
-    dl_href = rel_from(e.out_html, e.out_file)
+        def convert_image(image: mammoth.images.Image) -> dict:
+            img_counter["i"] += 1
+            ext = content_type_to_ext(image.content_type)
+            filename = f"img-{img_counter['i']:03d}.{ext}"
+            out_path = img_dir / filename
+            out_path.write_bytes(read_mammoth_image_bytes(image))
+            return {"src": rel_from(e.out_html, out_path)}
 
-    messages_html = ""
-    if getattr(result, "messages", None):
-        items = "".join(
-            f"<li>{BeautifulSoup(str(m), 'html.parser').get_text()}</li>"
-            for m in result.messages
-        )
-        messages_html = f"""
+        with e.src.open("rb") as f:
+            result = mammoth.convert_to_html(f, convert_image=mammoth.images.img_element(convert_image))
+
+        messages_html = ""
+        if getattr(result, "messages", None):
+            items = "".join(
+                f"<li>{BeautifulSoup(str(m), 'html.parser').get_text()}</li>"
+                for m in result.messages
+            )
+            messages_html = f"""
+              <div class="card">
+                <p><b>Dönüşüm uyarıları</b></p>
+                <ul>{items}</ul>
+              </div>
+              <hr />
+            """
+
+        html_section = f"""
+          <details>
+            <summary>HTML sürümü (yaklaşık biçim)</summary>
+            <hr />
+            {messages_html}
+            {result.value}
+          </details>
+        """
+
+    pdf_section = ""
+    if docx_render in {"pdf", "both"} and pdf_path.exists():
+        pdf_section = f"""
           <div class="card">
-            <p><b>Dönüşüm uyarıları</b></p>
-            <ul>{items}</ul>
+            <p><a class="btn" href="{dl_pdf}">⬇️ PDF indir</a> <a class="btn" href="{dl_docx}">⬇️ DOCX indir</a></p>
+          </div>
+          <hr />
+          <iframe src="{dl_pdf}" width="100%" height="900" style="border:1px solid #ddd; border-radius:12px;"></iframe>
+          <p><a class="btn" href="{dl_pdf}">PDF açılmazsa tıkla</a></p>
+        """
+    else:
+        pdf_section = f"""
+          <div class="card">
+            <p><a class="btn" href="{dl_docx}">⬇️ DOCX indir</a></p>
           </div>
           <hr />
         """
 
-    body = f"""
-      <div class="card">
-        <p><a class="btn" href="{dl_href}">⬇️ DOCX indir</a></p>
-      </div>
-      <hr />
-      {messages_html}
-      {result.value}
-    """
+    body = f"{pdf_section}{html_section}"
     e.out_html.write_text(
         wrap_html(
             title=e.title,
@@ -625,8 +694,16 @@ def build_indexes(entries: Iterable[Entry], *, lang: str, site_title: str) -> No
                 read_href = rel_from(DOCS_DIR / "index.html", e.out_html)
                 dl_href = rel_from(DOCS_DIR / "index.html", e.out_file)
                 icon = "📖" if e.kind == "docx" else "📄"
+
+                extra = ""
+                if e.kind == "docx":
+                    pdfp = docx_pdf_target(e)
+                    # link even if not exists yet; render mode may skip, but ok.
+                    pdf_href = rel_from(DOCS_DIR / "index.html", pdfp)
+                    extra = f' · <a href="{pdf_href}">⬇️ PDF</a>'
+
                 body_lines.append(
-                    f'<li>{icon} <a href="{read_href}">{e.title}</a> · <a href="{dl_href}">⬇️ {e.kind.upper()}</a></li>'
+                    f'<li>{icon} <a href="{read_href}">{e.title}</a> · <a href="{dl_href}">⬇️ {e.kind.upper()}</a>{extra}</li>'
                 )
             body_lines.append("</ul>")
 

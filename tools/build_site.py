@@ -47,7 +47,6 @@ OUT_DOWNLOADS = DOCS_DIR / "downloads"
 OUT_ASSETS = DOCS_DIR / "assets"
 OUT_CI = DOCS_DIR / "_ci"
 
-
 LOG = logging.getLogger("build_site")
 
 
@@ -102,10 +101,8 @@ def main() -> None:
             write_manifest(entries, status="success", error=None, current_entry=None)
 
     except SystemExit as e:
-        # Still write CI failure artifacts for nicer debugging.
-        error_msg = str(e)
         on_failure(
-            error=error_msg,
+            error=str(e),
             entries=entries,
             current_entry=current_entry,
             log_file=log_file,
@@ -113,9 +110,8 @@ def main() -> None:
         )
         raise
     except Exception as e:
-        tb = traceback.format_exc()
         on_failure(
-            error=tb,
+            error=traceback.format_exc(),
             entries=entries,
             current_entry=current_entry,
             log_file=log_file,
@@ -190,7 +186,6 @@ def on_failure(
     }
     (OUT_CI / "failure.json").write_text(json.dumps(failure_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # GitHub Actions friendly
     print("::error::build_site failed. See docs/_ci/failure.json and docs/_ci/build_site.log", file=sys.stderr)
     print(f"::group::Last {tail_lines} lines of build_site.log", file=sys.stderr)
     print(tail, file=sys.stderr)
@@ -449,6 +444,28 @@ def content_type_to_ext(ct: str) -> str:
     return m.get(ct, "bin")
 
 
+def read_mammoth_image_bytes(image: object) -> bytes:
+    """
+    mammoth Image API varies by version:
+      - some versions: image.read() -> bytes
+      - others: image.open() -> file-like (context manager)
+    """
+    read_fn = getattr(image, "read", None)
+    if callable(read_fn):
+        data = read_fn()
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+
+    open_fn = getattr(image, "open", None)
+    if callable(open_fn):
+        with open_fn() as f:  # type: ignore[misc]
+            data = f.read()
+            if isinstance(data, (bytes, bytearray)):
+                return bytes(data)
+
+    raise AttributeError("Unsupported mammoth image object (no read/open)")
+
+
 def wrap_html(*, title: str, body_html: str, home_href: str, lang: str) -> str:
     soup = BeautifulSoup("", "html.parser")
 
@@ -517,7 +534,7 @@ def build_docx(e: Entry, *, lang: str) -> None:
         ext = content_type_to_ext(image.content_type)
         filename = f"img-{img_counter['i']:03d}.{ext}"
         out_path = img_dir / filename
-        out_path.write_bytes(image.read())
+        out_path.write_bytes(read_mammoth_image_bytes(image))
         return {"src": rel_from(e.out_html, out_path)}
 
     with e.src.open("rb") as f:
@@ -680,13 +697,14 @@ def entry_to_json(e: Optional[Entry]) -> Optional[dict]:
 
 
 def write_manifest(entries: Iterable[Entry], *, status: str, error: Optional[str], current_entry: Optional[Entry]) -> None:
+    entries_l = list(entries)
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "status": status,
         "error": error,
         "current_entry": entry_to_json(current_entry),
-        "counts": {"entries": len(list(entries))},
-        "entries": [entry_to_json(e) for e in entries],
+        "counts": {"entries": len(entries_l)},
+        "entries": [entry_to_json(e) for e in entries_l],
     }
     (DOCS_DIR / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 

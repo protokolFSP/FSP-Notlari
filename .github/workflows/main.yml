@@ -1,0 +1,48 @@
+# FILE: .github/workflows/main.yml
+name: Sync Google Drive -> Build Pages (docx/pdf)
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "tools/**"
+      - ".github/workflows/main.yml"
+  schedule:
+    - cron: "17 3 * * *" # günlük (UTC)
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    env:
+      GDRIVE_FOLDER_URL: "https://drive.google.com/drive/folders/1_txELwSiGuQECVUEFmbis3sYMd-mIXXm?usp=sharing"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r tools/requirements.txt
+
+      - name: Sync Drive folder (public) into content/drive
+        run: python tools/build_site.py --sync-drive
+
+      - name: Build /docs from content/drive
+        run: python tools/build_site.py --build
+
+      - name: Commit generated /docs
+        run: |
+          if git diff --quiet; then
+            echo "No changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          git commit -m "build(pages): update generated notes"
+          git push

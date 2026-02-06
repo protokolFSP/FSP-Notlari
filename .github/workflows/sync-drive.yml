@@ -1,3 +1,4 @@
+# FILE: .github/workflows/sync-drive.yml
 name: Sync Drive -> Build Pages
 
 on:
@@ -30,16 +31,42 @@ jobs:
       - name: Sync Drive folder into content/drive
         run: python tools/build_site.py --sync-drive
 
-      - name: Debug: list synced files
+      - name: Debug: list files + sniff headers
         run: |
+          set -e
           echo "== content/drive tree =="
           find content/drive -maxdepth 5 -type f -print || true
-          echo "== docx/pdf count =="
+          echo "== sizes =="
+          ls -lah content/drive || true
+
+          echo "== header sniff (first 8 bytes hex) =="
           python - << 'PY'
           from pathlib import Path
-          p = Path("content/drive")
-          print("DOCX:", len(list(p.rglob("*.docx"))))
-          print("PDF :", len(list(p.rglob("*.pdf"))))
+          import binascii
+
+          root = Path("content/drive")
+          files = [p for p in root.rglob("*") if p.is_file()]
+          print("FILES:", len(files))
+
+          def head_hex(p: Path, n: int = 8) -> str:
+              try:
+                  with p.open("rb") as f:
+                      b = f.read(n)
+                  return binascii.hexlify(b).decode()
+              except Exception as e:
+                  return f"ERR:{e}"
+
+          docx = 0
+          pdf = 0
+          for p in sorted(files, key=lambda x: str(x).lower()):
+              hx = head_hex(p)
+              suf = p.suffix.lower()
+              if suf == ".docx": docx += 1
+              if suf == ".pdf": pdf += 1
+              print(f"- {p} | size={p.stat().st_size} | suffix={suf or '(none)'} | head8={hx}")
+
+          print("DOCX:", docx)
+          print("PDF :", pdf)
           PY
 
       - name: Build /docs from content/drive

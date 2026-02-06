@@ -5,13 +5,17 @@ on:
   workflow_dispatch: {}
   schedule:
     - cron: "17 3 * * *" # daily (UTC)
+# NOT: push tetikleyici YOK. (loop/boş fail olmasın)
+
+concurrency:
+  group: sync-drive-pages
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
   build:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     env:
       GDRIVE_FOLDER_URL: "https://drive.google.com/drive/folders/1ZrEoM0JtLm1pniqHOKsZW7YPmqHAL-rd?usp=sharing"
@@ -31,11 +35,8 @@ jobs:
       - name: Sync Drive folder into content/drive
         run: python tools/build_site.py --sync-drive
 
-      - name: Debug: list files
+      - name: Debug: docx/pdf count
         run: |
-          echo "== content/drive tree =="
-          find content/drive -maxdepth 5 -type f -print || true
-          echo "== docx/pdf count =="
           python - << 'PY'
           from pathlib import Path
           p = Path("content/drive")
@@ -52,6 +53,13 @@ jobs:
             echo "No changes."
             exit 0
           fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add docs
+          git commit -m "build(pages): update generated notes"
+
+          # non-fast-forward olmasın
+          git pull --rebase origin main
+          git push origin main

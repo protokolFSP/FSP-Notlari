@@ -15,10 +15,11 @@ Output (generated):
   docs/downloads/index.html
   docs/notes/**.html
   docs/downloads/**.(docx|pdf)
-  docs/assets/** (images extracted from docx)
+  docs/assets/**
 
-Why:
-  GitHub Pages does NOT convert DOCX to HTML. We generate HTML ourselves.
+Behavior:
+  - Sync step FAILS if no DOCX/PDF found (prevents committing an empty site).
+  - Uses gdown API first; falls back to gdown CLI if needed.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import argparse
 import os
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +67,7 @@ def main() -> None:
         if not GDRIVE_URL:
             raise SystemExit("GDRIVE_FOLDER_URL env is empty.")
         sync_drive_folder(GDRIVE_URL, SRC_DIR)
+        assert_has_docs(SRC_DIR)
 
     if args.build:
         ensure_dirs()
@@ -98,12 +101,60 @@ def clean_generated_dirs() -> None:
         d.mkdir(parents=True, exist_ok=True)
 
 
+def extract_folder_id(url: str) -> Optional[str]:
+    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    return None
+
+
 def sync_drive_folder(url: str, out_dir: Path) -> None:
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Folder must be "Anyone with the link" (public), otherwise this fails.
-    gdown.download_folder(url=url, output=str(out_dir), quiet=False, use_cookies=False)
+
+    # 1) Try gdown API
+    try:
+        folder_id = extract_folder_id(url)
+        kwargs = {"output": str(out_dir), "quiet": False, "use_cookies": True}
+        if folder_id:
+            paths = gdown.download_folder(id=folder_id, **kwargs)  # type: ignore[arg-type]
+        else:
+            paths = gdown.download_folder(url=url, **kwargs)  # type: ignore[arg-type]
+        if paths:
+            return
+    except Exception as e:
+        print(f"[sync] gdown API failed: {e}")
+
+    # 2) Fallback to gdown CLI
+    cmd = ["python", "-m", "gdown", "--folder", url, "-O", str(out_dir)]
+    print(f"[sync] fallback CLI: {' '.join(cmd)}")
+    subprocess.check_call(cmd)
+
+
+def assert_has_docs(root: Path) -> None:
+    docx = list(root.rglob("*.docx"))
+    pdf = list(root.rglob("*.pdf"))
+    if docx or pdf:
+        print(f"[sync] found DOCX={len(docx)} PDF={len(pdf)}")
+        return
+
+    # Helpful hint for Google Docs formats
+    gdocs = list(root.rglob("*.gdoc")) + list(root.rglob("*.gsheet")) + list(root.rglob("*.gslides"))
+    hint = ""
+    if gdocs:
+        hint = (
+            "\nIt looks like the folder contains Google Docs/Sheets/Slides.\n"
+            "Download/export them as .docx/.pdf and upload those files into the folder."
+        )
+
+    raise SystemExit(
+        "No .docx/.pdf found after sync. "
+        "Ensure Drive folder is 'Anyone with the link' (public) and files are real .docx/.pdf." + hint
+    )
 
 
 def slugify(text: str) -> str:
@@ -251,7 +302,14 @@ def build_docx(e: Entry) -> None:
       <hr />
       {result.value}
     """
-    e.out_html.write_text(wrap_html(title=e.title, body_html=body, home_href=rel_from(e.out_html, DOCS_DIR / "index.html").as_posix()), encoding="utf-8")
+    e.out_html.write_text(
+        wrap_html(
+            title=e.title,
+            body_html=body,
+            home_href=rel_from(e.out_html, DOCS_DIR / "index.html").as_posix(),
+        ),
+        encoding="utf-8",
+    )
 
 
 def build_pdf(e: Entry) -> None:
@@ -265,23 +323,29 @@ def build_pdf(e: Entry) -> None:
       <hr />
       <iframe src="{pdf_href}" width="100%" height="900" style="border:1px solid #ddd; border-radius:12px;"></iframe>
     """
-    e.out_html.write_text(wrap_html(title=e.title, body_html=body, home_href=rel_from(e.out_html, DOCS_DIR / "index.html").as_posix()), encoding="utf-8")
+    e.out_html.write_text(
+        wrap_html(
+            title=e.title,
+            body_html=body,
+            home_href=rel_from(e.out_html, DOCS_DIR / "index.html").as_posix(),
+        ),
+        encoding="utf-8",
+    )
 
 
 def build_indexes(entries: Iterable[Entry]) -> None:
     entries = list(entries)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    def group_key(e: Entry) -> str:
+    def gkey(e: Entry) -> str:
         return str(e.rel_dir) if str(e.rel_dir) else "Kök"
 
     grouped: dict[str, List[Entry]] = {}
     for e in entries:
-        grouped.setdefault(group_key(e), []).append(e)
+        grouped.setdefault(gkey(e), []).append(e)
 
-    # Main index.html
     body_lines: List[str] = [
-        f"<h1>FSP Notları</h1>",
+        "<h1>FSP Notları</h1>",
         f"<p><i>Otomatik güncellendi: {now}</i></p>",
         '<div class="card"><p>Notlar aşağıda listelenir. Okumak için başlığa tıkla, indirmek için sağdaki linki kullan.</p></div>',
         "<h2>İçerik</h2>",
@@ -290,10 +354,9 @@ def build_indexes(entries: Iterable[Entry]) -> None:
     if not entries:
         body_lines.append('<div class="card"><p>Henüz Drive’dan DOCX/PDF indirilemedi.</p></div>')
     else:
-        for gname in sorted(grouped.keys(), key=lambda x: x.lower()):
-            body_lines.append(f"<h3>{gname}</h3>")
-            body_lines.append("<ul>")
-            for e in sorted(grouped[gname], key=lambda x: x.title.lower()):
+        for name in sorted(grouped.keys(), key=lambda x: x.lower()):
+            body_lines.append(f"<h3>{name}</h3><ul>")
+            for e in sorted(grouped[name], key=lambda x: x.title.lower()):
                 assert e.out_html is not None
                 read_href = rel_from(DOCS_DIR / "index.html", e.out_html).as_posix()
                 dl_href = rel_from(DOCS_DIR / "index.html", e.out_file).as_posix()
@@ -301,34 +364,42 @@ def build_indexes(entries: Iterable[Entry]) -> None:
                 body_lines.append(f'<li>{icon} <a href="{read_href}">{e.title}</a> · <a href="{dl_href}">⬇️ {e.kind.upper()}</a></li>')
             body_lines.append("</ul>")
 
-    # Helpful section links
     body_lines += [
         "<hr />",
         "<p><a class='btn' href='./notes/index.html'>📚 Notes index</a> <a class='btn' href='./downloads/index.html'>⬇️ Downloads index</a></p>",
     ]
 
-    (DOCS_DIR / "index.html").write_text(wrap_html(title="FSP Notları", body_html="\n".join(body_lines), home_href="./index.html"), encoding="utf-8")
-
-    # notes/index.html
-    notes_lines = ["<h1>Notes</h1>", "<ul>"]
-    for e in sorted(entries, key=lambda x: (group_key(x).lower(), x.title.lower())):
-        assert e.out_html is not None
-        href = rel_from(OUT_NOTES / "index.html", e.out_html).as_posix()
-        notes_lines.append(f'<li><a href="{href}">{e.title}</a></li>')
-    notes_lines.append("</ul>")
-    (OUT_NOTES / "index.html").write_text(
-        wrap_html(title="Notes", body_html="\n".join(notes_lines), home_href=rel_from(OUT_NOTES / "index.html", DOCS_DIR / "index.html").as_posix()),
+    (DOCS_DIR / "index.html").write_text(
+        wrap_html(title="FSP Notları", body_html="\n".join(body_lines), home_href="./index.html"),
         encoding="utf-8",
     )
 
-    # downloads/index.html
-    dl_lines = ["<h1>Downloads</h1>", "<ul>"]
-    for e in sorted(entries, key=lambda x: (group_key(x).lower(), x.title.lower())):
-        href = rel_from(OUT_DOWNLOADS / "index.html", e.out_file).as_posix()
-        dl_lines.append(f'<li><a href="{href}">{e.title} ({e.kind.upper()})</a></li>')
-    dl_lines.append("</ul>")
+    (OUT_NOTES / "index.html").write_text(
+        wrap_html(
+            title="Notes",
+            body_html="<h1>Notes</h1><ul>"
+            + "\n".join(
+                f'<li><a href="{rel_from(OUT_NOTES / "index.html", e.out_html).as_posix()}">{e.title}</a></li>'
+                for e in sorted(entries, key=lambda x: (gkey(x).lower(), x.title.lower()))
+                if e.out_html is not None
+            )
+            + "</ul>",
+            home_href=rel_from(OUT_NOTES / "index.html", DOCS_DIR / "index.html").as_posix(),
+        ),
+        encoding="utf-8",
+    )
+
     (OUT_DOWNLOADS / "index.html").write_text(
-        wrap_html(title="Downloads", body_html="\n".join(dl_lines), home_href=rel_from(OUT_DOWNLOADS / "index.html", DOCS_DIR / "index.html").as_posix()),
+        wrap_html(
+            title="Downloads",
+            body_html="<h1>Downloads</h1><ul>"
+            + "\n".join(
+                f'<li><a href="{rel_from(OUT_DOWNLOADS / "index.html", e.out_file).as_posix()}">{e.title} ({e.kind.upper()})</a></li>'
+                for e in sorted(entries, key=lambda x: (gkey(x).lower(), x.title.lower()))
+            )
+            + "</ul>",
+            home_href=rel_from(OUT_DOWNLOADS / "index.html", DOCS_DIR / "index.html").as_posix(),
+        ),
         encoding="utf-8",
     )
 

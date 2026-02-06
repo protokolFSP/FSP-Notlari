@@ -38,6 +38,27 @@ jobs:
 
       - name: Install deps
         run: pip install -r tools/requirements.txt
+        # FILE: .github/workflows/deploy-pages.yml
+# ... aynı dosya, aynı job ...
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: tools/requirements.txt
+
+      - name: Install deps
+        run: pip install -r tools/requirements.txt
+
+      - name: Install LibreOffice
+        run: sudo apt-get update && sudo apt-get install -y libreoffice
+
+      - name: Sync Drive + Build /docs
+        run: python tools/build_site.py --all
+
 
       - name: Sync Drive + Build /docs
         run: python tools/build_site.py --all

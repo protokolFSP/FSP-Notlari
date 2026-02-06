@@ -1,0 +1,4 @@
+# FILE: tools/requirements.txt
+mammoth==1.7.1
+beautifulsoup4==4.12.3
+gdown==5.2.0

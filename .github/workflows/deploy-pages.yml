@@ -1,0 +1,61 @@
+# FILE: .github/workflows/deploy-pages.yml
+name: Sync Drive -> Deploy Pages (no commit)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *" # daily (UTC)
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GDRIVE_FOLDER_URL: "https://drive.google.com/drive/folders/1ZrEoM0JtLm1pniqHOKsZW7YPmqHAL-rd?usp=sharing"
+      PYTHONUNBUFFERED: "1"
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: tools/requirements.txt
+
+      - name: Install deps
+        run: pip install -r tools/requirements.txt
+
+      - name: Sync Drive + Build /docs
+        run: python tools/build_site.py --all
+
+      - name: Upload CI artifacts (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_site_debug
+          path: |
+            docs/_ci/**
+            docs/manifest.json
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -14,7 +14,7 @@ jobs:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     env:
-      GDRIVE_FOLDER_URL: "https://drive.google.com/drive/folders/1_txELwSiGuQECVUEFmbis3sYMd-mIXXm?usp=sharing"
+      GDRIVE_FOLDER_URL: "https://drive.google.com/drive/folders/1ZrEoM0JtLm1pniqHOKsZW7YPmqHAL-rd?usp=drive_link"
     steps:
       - uses: actions/checkout@v4
 

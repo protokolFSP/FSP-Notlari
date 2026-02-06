@@ -1,6 +1,6 @@
 # FILE: tools/build_site.py
 """
-Google Drive (public folder) -> GitHub Pages builder.
+Google Drive (public folder) -> GitHub Pages static site builder (no Jekyll).
 
 Usage:
   python tools/build_site.py --sync-drive
@@ -10,14 +10,15 @@ Input (synced):
   content/drive/**.(docx|pdf)
 
 Output (generated):
-  docs/index.md
+  docs/index.html
+  docs/notes/index.html
+  docs/downloads/index.html
   docs/notes/**.html
   docs/downloads/**.(docx|pdf)
   docs/assets/** (images extracted from docx)
 
-Notes:
-  - GitHub Pages does not convert DOCX to HTML automatically.
-  - Drive folder must be shared as "Anyone with the link" (public).
+Why:
+  GitHub Pages does NOT convert DOCX to HTML. We generate HTML ourselves.
 """
 
 from __future__ import annotations
@@ -72,9 +73,9 @@ def main() -> None:
         for e in entries:
             if e.kind == "docx":
                 build_docx(e)
-            elif e.kind == "pdf":
+            else:
                 build_pdf(e)
-        build_index(entries)
+        build_indexes(entries)
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,7 +102,7 @@ def sync_drive_folder(url: str, out_dir: Path) -> None:
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Public folder required. If not public, download will fail.
+    # Folder must be "Anyone with the link" (public), otherwise this fails.
     gdown.download_folder(url=url, output=str(out_dir), quiet=False, use_cookies=False)
 
 
@@ -144,31 +145,11 @@ def collect_entries(root: Path) -> List[Entry]:
         if ext == ".docx":
             out_html = out_dir_notes / f"{rel_stem}.html"
             out_file = out_dir_dl / f"{rel_stem}.docx"
-            entries.append(
-                Entry(
-                    kind="docx",
-                    title=title,
-                    rel_dir=rel_dir,
-                    rel_stem=rel_stem,
-                    src=f,
-                    out_html=out_html,
-                    out_file=out_file,
-                )
-            )
+            entries.append(Entry("docx", title, rel_dir, rel_stem, f, out_html, out_file))
         else:
             out_html = out_dir_notes / f"{rel_stem}.pdf.html"
             out_file = out_dir_dl / f"{rel_stem}.pdf"
-            entries.append(
-                Entry(
-                    kind="pdf",
-                    title=title,
-                    rel_dir=rel_dir,
-                    rel_stem=rel_stem,
-                    src=f,
-                    out_html=out_html,
-                    out_file=out_file,
-                )
-            )
+            entries.append(Entry("pdf", title, rel_dir, rel_stem, f, out_html, out_file))
 
     return entries
 
@@ -189,27 +170,28 @@ def content_type_to_ext(ct: str) -> str:
     return m.get(ct, "bin")
 
 
-def wrap_html(*, title: str, body_html: str, download_href: str, home_href: str) -> str:
+def wrap_html(*, title: str, body_html: str, home_href: str) -> str:
     soup = BeautifulSoup("", "html.parser")
 
     html = soup.new_tag("html", lang="tr")
     head = soup.new_tag("head")
     head.append(soup.new_tag("meta", charset="utf-8"))
     head.append(soup.new_tag("meta", attrs={"name": "viewport", "content": "width=device-width, initial-scale=1"}))
-
     t = soup.new_tag("title")
     t.string = title
     head.append(t)
 
     style = soup.new_tag("style")
     style.string = """
-      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.6;margin:0}
+      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.6;margin:0;background:#fff}
       .wrap{max-width:980px;margin:0 auto;padding:24px}
       .topbar{position:sticky;top:0;background:#fff;border-bottom:1px solid #eee}
       .topbar .wrap{display:flex;gap:12px;align-items:center;justify-content:space-between}
       .btns{display:flex;gap:10px;flex-wrap:wrap}
       a.btn{display:inline-block;padding:10px 12px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:inherit}
       a.btn:hover{background:#fafafa}
+      .card{border:1px solid #eee;border-radius:16px;padding:16px}
+      ul{padding-left:18px}
       img{max-width:100%;height:auto}
       table{border-collapse:collapse;width:100%;overflow-x:auto;display:block}
       th,td{border:1px solid #ddd;padding:8px}
@@ -228,9 +210,7 @@ def wrap_html(*, title: str, body_html: str, download_href: str, home_href: str)
     btns = soup.new_tag("div", attrs={"class": "btns"})
     a_home = soup.new_tag("a", href=home_href, attrs={"class": "btn"})
     a_home.string = "← Ana sayfa"
-    a_dl = soup.new_tag("a", href=download_href, attrs={"class": "btn"})
-    a_dl.string = "⬇️ İndir"
-    btns.extend([a_home, a_dl])
+    btns.append(a_home)
 
     topwrap.extend([title_div, btns])
     topbar.append(topwrap)
@@ -258,76 +238,99 @@ def build_docx(e: Entry) -> None:
         filename = f"img-{img_counter['i']:03d}.{ext}"
         out_path = img_dir / filename
         out_path.write_bytes(image.read())
-
-        img_rel = rel_from(e.out_html, out_path)
-        return {"src": img_rel.as_posix()}
+        return {"src": rel_from(e.out_html, out_path).as_posix()}
 
     with e.src.open("rb") as f:
         result = mammoth.convert_to_html(f, convert_image=mammoth.images.img_element(convert_image))
 
-    full = wrap_html(
-        title=e.title,
-        body_html=result.value,
-        download_href=rel_from(e.out_html, e.out_file).as_posix(),
-        home_href=rel_from(e.out_html, DOCS_DIR / "index.md").as_posix(),
-    )
-    e.out_html.write_text(full, encoding="utf-8")
+    dl_href = rel_from(e.out_html, e.out_file).as_posix()
+    body = f"""
+      <div class="card">
+        <p><a class="btn" href="{dl_href}">⬇️ DOCX indir</a></p>
+      </div>
+      <hr />
+      {result.value}
+    """
+    e.out_html.write_text(wrap_html(title=e.title, body_html=body, home_href=rel_from(e.out_html, DOCS_DIR / "index.html").as_posix()), encoding="utf-8")
 
 
 def build_pdf(e: Entry) -> None:
     assert e.out_html is not None
     shutil.copy2(e.src, e.out_file)
-
     pdf_href = rel_from(e.out_html, e.out_file).as_posix()
-    body_html = f"""
-      <p><a class="btn" href="{pdf_href}">⬇️ PDF indir</a></p>
+    body = f"""
+      <div class="card">
+        <p><a class="btn" href="{pdf_href}">⬇️ PDF indir</a></p>
+      </div>
+      <hr />
       <iframe src="{pdf_href}" width="100%" height="900" style="border:1px solid #ddd; border-radius:12px;"></iframe>
     """
-
-    full = wrap_html(
-        title=e.title,
-        body_html=body_html,
-        download_href=pdf_href,
-        home_href=rel_from(e.out_html, DOCS_DIR / "index.md").as_posix(),
-    )
-    e.out_html.write_text(full, encoding="utf-8")
+    e.out_html.write_text(wrap_html(title=e.title, body_html=body, home_href=rel_from(e.out_html, DOCS_DIR / "index.html").as_posix()), encoding="utf-8")
 
 
-def build_index(entries: Iterable[Entry]) -> None:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def build_indexes(entries: Iterable[Entry]) -> None:
     entries = list(entries)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    lines = [
-        "# FSP Notları",
-        "",
-        f"_Otomatik güncellendi: {now}_",
-        "",
-        "## İçerik",
-        "",
-    ]
-
-    if not entries:
-        lines += ["Henüz Drive’dan (DOCX/PDF) içerik indirilemedi.", ""]
-        (DOCS_DIR / "index.md").write_text("\n".join(lines), encoding="utf-8")
-        return
+    def group_key(e: Entry) -> str:
+        return str(e.rel_dir) if str(e.rel_dir) else "Kök"
 
     grouped: dict[str, List[Entry]] = {}
     for e in entries:
-        key = str(e.rel_dir) if str(e.rel_dir) else "Kök"
-        grouped.setdefault(key, []).append(e)
+        grouped.setdefault(group_key(e), []).append(e)
 
-    for group_name in sorted(grouped.keys(), key=lambda x: x.lower()):
-        lines.append(f"### {group_name}")
-        lines.append("")
-        for e in sorted(grouped[group_name], key=lambda x: x.title.lower()):
-            assert e.out_html is not None
-            html_href = Path("notes") / e.rel_dir / e.out_html.name
-            dl_href = Path("downloads") / e.rel_dir / e.out_file.name
-            icon = "📖" if e.kind == "docx" else "📄"
-            lines.append(f"- {icon} [{e.title}]({html_href.as_posix()}) · ⬇️ [{e.kind.upper()}]({dl_href.as_posix()})")
-        lines.append("")
+    # Main index.html
+    body_lines: List[str] = [
+        f"<h1>FSP Notları</h1>",
+        f"<p><i>Otomatik güncellendi: {now}</i></p>",
+        '<div class="card"><p>Notlar aşağıda listelenir. Okumak için başlığa tıkla, indirmek için sağdaki linki kullan.</p></div>',
+        "<h2>İçerik</h2>",
+    ]
 
-    (DOCS_DIR / "index.md").write_text("\n".join(lines), encoding="utf-8")
+    if not entries:
+        body_lines.append('<div class="card"><p>Henüz Drive’dan DOCX/PDF indirilemedi.</p></div>')
+    else:
+        for gname in sorted(grouped.keys(), key=lambda x: x.lower()):
+            body_lines.append(f"<h3>{gname}</h3>")
+            body_lines.append("<ul>")
+            for e in sorted(grouped[gname], key=lambda x: x.title.lower()):
+                assert e.out_html is not None
+                read_href = rel_from(DOCS_DIR / "index.html", e.out_html).as_posix()
+                dl_href = rel_from(DOCS_DIR / "index.html", e.out_file).as_posix()
+                icon = "📖" if e.kind == "docx" else "📄"
+                body_lines.append(f'<li>{icon} <a href="{read_href}">{e.title}</a> · <a href="{dl_href}">⬇️ {e.kind.upper()}</a></li>')
+            body_lines.append("</ul>")
+
+    # Helpful section links
+    body_lines += [
+        "<hr />",
+        "<p><a class='btn' href='./notes/index.html'>📚 Notes index</a> <a class='btn' href='./downloads/index.html'>⬇️ Downloads index</a></p>",
+    ]
+
+    (DOCS_DIR / "index.html").write_text(wrap_html(title="FSP Notları", body_html="\n".join(body_lines), home_href="./index.html"), encoding="utf-8")
+
+    # notes/index.html
+    notes_lines = ["<h1>Notes</h1>", "<ul>"]
+    for e in sorted(entries, key=lambda x: (group_key(x).lower(), x.title.lower())):
+        assert e.out_html is not None
+        href = rel_from(OUT_NOTES / "index.html", e.out_html).as_posix()
+        notes_lines.append(f'<li><a href="{href}">{e.title}</a></li>')
+    notes_lines.append("</ul>")
+    (OUT_NOTES / "index.html").write_text(
+        wrap_html(title="Notes", body_html="\n".join(notes_lines), home_href=rel_from(OUT_NOTES / "index.html", DOCS_DIR / "index.html").as_posix()),
+        encoding="utf-8",
+    )
+
+    # downloads/index.html
+    dl_lines = ["<h1>Downloads</h1>", "<ul>"]
+    for e in sorted(entries, key=lambda x: (group_key(x).lower(), x.title.lower())):
+        href = rel_from(OUT_DOWNLOADS / "index.html", e.out_file).as_posix()
+        dl_lines.append(f'<li><a href="{href}">{e.title} ({e.kind.upper()})</a></li>')
+    dl_lines.append("</ul>")
+    (OUT_DOWNLOADS / "index.html").write_text(
+        wrap_html(title="Downloads", body_html="\n".join(dl_lines), home_href=rel_from(OUT_DOWNLOADS / "index.html", DOCS_DIR / "index.html").as_posix()),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

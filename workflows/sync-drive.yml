@@ -14,7 +14,7 @@ jobs:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     env:
-      GDRIVE_FOLDER_URL: "https://drive.google.com/drive/folders/1ZrEoM0JtLm1pniqHOKsZW7YPmqHAL-rd?usp=drive_link"
+      GDRIVE_FOLDER_URL: "https://drive.google.com/drive/folders/1ZrEoM0JtLm1pniqHOKsZW7YPmqHAL-rd?usp=sharing"
     steps:
       - uses: actions/checkout@v4
 
@@ -25,10 +25,13 @@ jobs:
       - name: Install deps
         run: pip install -r tools/requirements.txt
 
+      - name: Debug: show Drive URL
+        run: echo "GDRIVE_FOLDER_URL=$GDRIVE_FOLDER_URL"
+
       - name: Sync Drive folder into content/drive
         run: python tools/build_site.py --sync-drive
 
-      - name: Debug: list synced files
+      - name: Debug: list files
         run: |
           echo "== content/drive tree =="
           find content/drive -maxdepth 5 -type f -print || true
@@ -52,5 +55,3 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs
-          git commit -m "build(pages): update generated notes"
-          git push

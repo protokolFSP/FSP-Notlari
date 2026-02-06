@@ -14,6 +14,7 @@ Features:
   - docs/downloads/** (original files)
   - docs/assets/** (extracted images from docx)
   - docs/manifest.json
+  - docs/_ci/build_site.log + docs/_ci/failure.json (on failures)
 """
 
 from __future__ import annotations
@@ -21,10 +22,13 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
+import sys
+import traceback
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +45,10 @@ DOCS_DIR = ROOT / "docs"
 OUT_NOTES = DOCS_DIR / "notes"
 OUT_DOWNLOADS = DOCS_DIR / "downloads"
 OUT_ASSETS = DOCS_DIR / "assets"
+OUT_CI = DOCS_DIR / "_ci"
+
+
+LOG = logging.getLogger("build_site")
 
 
 @dataclass(frozen=True)
@@ -58,29 +66,62 @@ class Entry:
 def main() -> None:
     args = parse_args()
 
-    do_sync = args.all or args.sync_drive
-    do_build = args.all or args.build
+    log_file = Path(args.log_file).resolve()
+    configure_logging(log_file, args.log_level)
 
-    if do_sync:
-        url = require_env_url()
-        sync_drive_folder(url, SRC_DIR)
-        normalize_downloaded_files(SRC_DIR)
-        assert_has_docs(SRC_DIR)
+    entries: List[Entry] = []
+    current_entry: Optional[Entry] = None
 
-    if do_build:
-        ensure_dirs()
-        if not args.no_clean:
-            clean_generated_dirs()
-        entries = collect_entries(SRC_DIR)
+    try:
+        do_sync = args.all or args.sync_drive
+        do_build = args.all or args.build
 
-        for e in entries:
-            if e.kind == "docx":
-                build_docx(e, lang=args.lang, site_title=args.site_title)
-            else:
-                build_pdf(e, lang=args.lang, site_title=args.site_title)
+        if do_sync:
+            url = require_env_url()
+            sync_drive_folder(url, SRC_DIR)
+            normalize_downloaded_files(SRC_DIR)
+            assert_has_docs(SRC_DIR)
 
-        build_indexes(entries, lang=args.lang, site_title=args.site_title)
-        write_manifest(entries)
+        if do_build:
+            ensure_dirs()
+            if not args.no_clean:
+                clean_generated_dirs()
+
+            entries = collect_entries(SRC_DIR)
+            write_manifest(entries, status="collected", error=None, current_entry=None)
+
+            for e in entries:
+                current_entry = e
+                LOG.info("[build] %s -> %s", e.src, e.out_html)
+                if e.kind == "docx":
+                    build_docx(e, lang=args.lang)
+                else:
+                    build_pdf(e, lang=args.lang)
+
+            build_indexes(entries, lang=args.lang, site_title=args.site_title)
+            write_manifest(entries, status="success", error=None, current_entry=None)
+
+    except SystemExit as e:
+        # Still write CI failure artifacts for nicer debugging.
+        error_msg = str(e)
+        on_failure(
+            error=error_msg,
+            entries=entries,
+            current_entry=current_entry,
+            log_file=log_file,
+            tail_lines=args.log_tail_lines,
+        )
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        on_failure(
+            error=tb,
+            entries=entries,
+            current_entry=current_entry,
+            log_file=log_file,
+            tail_lines=args.log_tail_lines,
+        )
+        raise SystemExit(1) from e
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,9 +130,79 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--build", action="store_true", help="Build docs/ site from content/drive")
     p.add_argument("--all", action="store_true", help="Run sync + build")
     p.add_argument("--no-clean", action="store_true", help="Do not delete docs/{notes,downloads,assets} before build")
+
     p.add_argument("--lang", default="tr", help="HTML <html lang='...'>")
     p.add_argument("--site-title", default="FSP Notları", help="Root index title")
+
+    p.add_argument("--log-file", default=str(OUT_CI / "build_site.log"), help="Log file path (for CI artifacts)")
+    p.add_argument("--log-level", default="INFO", help="DEBUG|INFO|WARNING|ERROR")
+    p.add_argument("--log-tail-lines", type=int, default=50, help="How many log lines to print on failure")
     return p.parse_args()
+
+
+def configure_logging(log_file: Path, level: str) -> None:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    LOG.setLevel(lvl)
+    LOG.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(lvl)
+    sh.setFormatter(fmt)
+
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(lvl)
+    fh.setFormatter(fmt)
+
+    LOG.addHandler(sh)
+    LOG.addHandler(fh)
+
+    LOG.info("[init] log_file=%s level=%s", log_file, level.upper())
+
+
+def on_failure(
+    *,
+    error: str,
+    entries: List[Entry],
+    current_entry: Optional[Entry],
+    log_file: Path,
+    tail_lines: int,
+) -> None:
+    ensure_dirs()
+    OUT_CI.mkdir(parents=True, exist_ok=True)
+
+    LOG.error("[fail] build_site failed")
+    LOG.error("%s", error)
+
+    write_manifest(entries, status="failed", error=error, current_entry=current_entry)
+
+    tail = tail_file(log_file, tail_lines)
+    failure_payload = {
+        "failed_at": datetime.now(timezone.utc).isoformat(),
+        "error": error,
+        "current_entry": entry_to_json(current_entry) if current_entry else None,
+        "log_file": str(log_file),
+        "log_tail_lines": tail_lines,
+        "log_tail": tail,
+    }
+    (OUT_CI / "failure.json").write_text(json.dumps(failure_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # GitHub Actions friendly
+    print("::error::build_site failed. See docs/_ci/failure.json and docs/_ci/build_site.log", file=sys.stderr)
+    print(f"::group::Last {tail_lines} lines of build_site.log", file=sys.stderr)
+    print(tail, file=sys.stderr)
+    print("::endgroup::", file=sys.stderr)
+
+
+def tail_file(path: Path, n: int) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        return "\n".join(lines[-n:]) if lines else ""
+    except OSError:
+        return ""
 
 
 def require_env_url() -> str:
@@ -105,6 +216,7 @@ def ensure_dirs() -> None:
     SRC_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
     (DOCS_DIR / ".nojekyll").write_text("", encoding="utf-8")
+    OUT_CI.mkdir(parents=True, exist_ok=True)
 
 
 def clean_generated_dirs() -> None:
@@ -118,7 +230,7 @@ def extract_folder_id(url: str) -> Optional[str]:
     patterns = [
         r"/folders/([a-zA-Z0-9_-]+)",
         r"[?&]id=([a-zA-Z0-9_-]+)",
-        r"^([a-zA-Z0-9_-]{10,})$",  # bare id
+        r"^([a-zA-Z0-9_-]{10,})$",
     ]
     for pat in patterns:
         m = re.search(pat, url)
@@ -153,16 +265,17 @@ def sync_drive_folder(url: str, out_dir: Path) -> None:
                 else gdown.download_folder(url=url, **kwargs)  # type: ignore[arg-type]
             )
             if paths:
+                LOG.info("[sync] downloaded %d paths", len(paths))
                 return
         except Exception as e:
-            print(f"[sync] gdown API failed (use_cookies={use_cookies}): {e}")
+            LOG.warning("[sync] gdown API failed (use_cookies=%s): %s", use_cookies, e)
 
     cmd = ["python", "-m", "gdown", "--folder", url, "-O", str(out_dir)]
-    print(f"[sync] fallback CLI: {' '.join(cmd)}")
+    LOG.info("[sync] fallback CLI: %s", " ".join(cmd))
     subprocess.check_call(cmd)
 
 
-def read_head(path: Path, n: int = 1024) -> bytes:
+def read_head(path: Path, n: int = 2048) -> bytes:
     try:
         with path.open("rb") as f:
             return f.read(n)
@@ -222,12 +335,12 @@ def normalize_downloaded_files(root: Path) -> None:
             if ext != f".{kind}":
                 target = unique_path(p.with_suffix(f".{kind}"))
                 p.rename(target)
-                print(f"[normalize] {p} -> {target}")
+                LOG.info("[normalize] %s -> %s", p, target)
             continue
 
         target = unique_path(p.with_suffix(f".{kind}"))
         p.rename(target)
-        print(f"[normalize] {p} -> {target}")
+        LOG.info("[normalize] %s -> %s", p, target)
 
     if html_errors:
         msg = (
@@ -242,7 +355,7 @@ def assert_has_docs(root: Path) -> None:
     docx = list(root.rglob("*.docx"))
     pdf = list(root.rglob("*.pdf"))
     if docx or pdf:
-        print(f"[sync] found DOCX={len(docx)} PDF={len(pdf)}")
+        LOG.info("[sync] found DOCX=%d PDF=%d", len(docx), len(pdf))
         return
     raise SystemExit(
         "No .docx/.pdf found after sync.\n"
@@ -315,7 +428,9 @@ def collect_entries(root: Path) -> List[Entry]:
             out_file = out_dir_dl / f"{rel_stem}.pdf"
             entries.append(Entry("pdf", title, rel_dir, rel_stem, f, out_html, out_file, sort_key))
 
-    return sorted(entries, key=lambda e: (str(e.rel_dir).lower(), e.sort_key))
+    entries = sorted(entries, key=lambda e: (str(e.rel_dir).lower(), e.sort_key))
+    LOG.info("[build] collected entries=%d", len(entries))
+    return entries
 
 
 def rel_from(frm: Path, to: Path) -> str:
@@ -390,7 +505,7 @@ def wrap_html(*, title: str, body_html: str, home_href: str, lang: str) -> str:
     return "<!doctype html>\n" + str(soup)
 
 
-def build_docx(e: Entry, *, lang: str, site_title: str) -> None:
+def build_docx(e: Entry, *, lang: str) -> None:
     shutil.copy2(e.src, e.out_file)
 
     img_dir = OUT_ASSETS / e.rel_dir / e.rel_stem
@@ -405,17 +520,17 @@ def build_docx(e: Entry, *, lang: str, site_title: str) -> None:
         out_path.write_bytes(image.read())
         return {"src": rel_from(e.out_html, out_path)}
 
-    try:
-        with e.src.open("rb") as f:
-            result = mammoth.convert_to_html(f, convert_image=mammoth.images.img_element(convert_image))
-    except Exception as ex:
-        raise SystemExit(f"Failed to convert DOCX to HTML: {e.src}\n{ex}") from ex
+    with e.src.open("rb") as f:
+        result = mammoth.convert_to_html(f, convert_image=mammoth.images.img_element(convert_image))
 
     dl_href = rel_from(e.out_html, e.out_file)
 
     messages_html = ""
     if getattr(result, "messages", None):
-        items = "".join(f"<li>{BeautifulSoup(str(m), 'html.parser').get_text()}</li>" for m in result.messages)
+        items = "".join(
+            f"<li>{BeautifulSoup(str(m), 'html.parser').get_text()}</li>"
+            for m in result.messages
+        )
         messages_html = f"""
           <div class="card">
             <p><b>Dönüşüm uyarıları</b></p>
@@ -443,7 +558,7 @@ def build_docx(e: Entry, *, lang: str, site_title: str) -> None:
     )
 
 
-def build_pdf(e: Entry, *, lang: str, site_title: str) -> None:
+def build_pdf(e: Entry, *, lang: str) -> None:
     shutil.copy2(e.src, e.out_file)
     pdf_href = rel_from(e.out_html, e.out_file)
     body = f"""
@@ -553,24 +668,25 @@ def _build_flat_index_html(entries: List[Entry], *, base: Path, kind: str) -> st
     return "\n".join(lines) if lines else "<div class='card'><p>Boş.</p></div>"
 
 
-def write_manifest(entries: Iterable[Entry]) -> None:
-    now = datetime.now(timezone.utc).isoformat()
+def entry_to_json(e: Optional[Entry]) -> Optional[dict]:
+    if not e:
+        return None
+    d = asdict(e)
+    d["rel_dir"] = str(e.rel_dir).replace("\\", "/")
+    d["src"] = str(e.src)
+    d["out_html"] = str(e.out_html)
+    d["out_file"] = str(e.out_file)
+    return d
+
+
+def write_manifest(entries: Iterable[Entry], *, status: str, error: Optional[str], current_entry: Optional[Entry]) -> None:
     payload = {
-        "generated_at": now,
-        "entries": [
-            {
-                **asdict(e),
-                "rel_dir": str(e.rel_dir).replace("\\", "/"),
-                "src": str(e.src),
-                "out_html": str(e.out_html),
-                "out_file": str(e.out_file),
-                "src_size": e.src.stat().st_size if e.src.exists() else None,
-                "src_mtime": datetime.fromtimestamp(e.src.stat().st_mtime, tz=timezone.utc).isoformat()
-                if e.src.exists()
-                else None,
-            }
-            for e in entries
-        ],
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "error": error,
+        "current_entry": entry_to_json(current_entry),
+        "counts": {"entries": len(list(entries))},
+        "entries": [entry_to_json(e) for e in entries],
     }
     (DOCS_DIR / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
